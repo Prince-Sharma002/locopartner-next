@@ -1,6 +1,25 @@
-const mongoose = require('mongoose');
+import mongoose, { Document, Model } from 'mongoose';
 
-const userSchema = new mongoose.Schema({
+export interface IUser extends Document {
+  name: string;
+  email: string;
+  partners: mongoose.Types.ObjectId[];
+  pendingPartners: mongoose.Types.ObjectId[];
+  location: {
+    type: string;
+    coordinates: number[];
+  };
+  mood: string;
+  settings: {
+    isSharingPaused: boolean;
+    isInvisible: boolean;
+    visibilityType: 'Exact' | 'Approximate' | 'Off';
+    trackingRadius: number;
+  };
+  lastUpdated: Date;
+}
+
+const userSchema = new mongoose.Schema<IUser>({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
   partners: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
@@ -36,4 +55,6 @@ const userSchema = new mongoose.Schema({
 
 userSchema.index({ location: '2dsphere' });
 
-module.exports = mongoose.models.User || mongoose.model('User', userSchema);
+const User: Model<IUser> = mongoose.models.User || mongoose.model<IUser>('User', userSchema);
+
+export default User;

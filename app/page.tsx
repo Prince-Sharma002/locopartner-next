@@ -1,8 +1,7 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import axios from 'axios';
-import { getSocket } from '@/lib/socket';
 import MapComponent from '@/components/MapComponent';
 import MoodSelector from '@/components/MoodSelector';
 import ControlPanel from '@/components/ControlPanel';
@@ -10,7 +9,7 @@ import SettingsPanel from '@/components/SettingsPanel';
 import { motion, AnimatePresence } from 'framer-motion';
 import { MapPin, ArrowRight, Bell, Users, Check } from 'lucide-react';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000/api';
+const API_URL = '/api';
 
 export default function Home() {
   const [user, setUser] = useState<any>(null);
@@ -19,7 +18,11 @@ export default function Home() {
   const [partnerEmail, setPartnerEmail] = useState('');
   const [loading, setLoading] = useState(true);
   const [notifications, setNotifications] = useState<string[]>([]);
-  const [wasInRadiusMap, setWasInRadiusMap] = useState<{ [key: string]: boolean }>({});
+  
+  const wasInRadiusMap = useRef<{ [key: string]: boolean }>({});
+  const lastMoodMap = useRef<{ [key: string]: string }>({});
+  const locationRef = useRef<{ latitude: number | null, longitude: number | null }>({ latitude: null, longitude: null });
+  const moodRef = useRef<string | null>(null);
 
   const addNotification = (msg: string) => {
     setNotifications(prev => [msg, ...prev].slice(0, 10));
@@ -41,7 +44,6 @@ export default function Home() {
     } catch (err) {
       console.error('Session failed', err);
       localStorage.removeItem('locometer_user_id');
-    } finally {
       setLoading(false);
     }
   };
@@ -49,44 +51,14 @@ export default function Home() {
   const initSession = (userData: any) => {
     setUser(userData);
     localStorage.setItem('locometer_user_id', userData._id);
+    moodRef.current = userData.mood;
 
     if (userData.partners) {
       setPartners(userData.partners.map((p: any) => ({ ...p, distance: null })));
     }
 
-    const socket = getSocket();
-    socket.emit('join', userData._id);
-
-    socket.on('partnerLocationUpdate', (data) => {
-      const { partnerId, partnerName, distance, latitude, longitude } = data;
-      setPartners(prev => {
-        const index = prev.findIndex(p => p._id === partnerId);
-        const newPartner = { _id: partnerId, name: partnerName, distance, location: { coordinates: [longitude, latitude] } };
-        if (index > -1) {
-           const newPartners = [...prev];
-           newPartners[index] = newPartner;
-           return newPartners;
-        }
-        return [...prev, newPartner];
-      });
-
-      const radius = userData?.settings?.trackingRadius || 5;
-      const inRadius = distance <= radius;
-      setWasInRadiusMap(prev => {
-        const wasIn = prev[partnerId];
-        if (wasIn !== undefined && inRadius !== wasIn) {
-          if (inRadius) addNotification(`${partnerName} entered your ${radius}km area 👀`);
-          else addNotification(`${partnerName} left your zone 🚶‍♀️`);
-        }
-        return { ...prev, [partnerId]: inRadius };
-      });
-    });
-
-    socket.on('partnerMoodUpdate', (data) => {
-      addNotification(`${data.partnerName} is now feeling: ${data.mood}`);
-    });
-
-    startTracking(userData._id);
+    startTracking();
+    setLoading(false);
   };
 
   const handleLogin = async (e: React.FormEvent) => {
@@ -97,7 +69,6 @@ export default function Home() {
       initSession(res.data);
     } catch (err) {
       console.error(err);
-    } finally {
       setLoading(false);
     }
   };
@@ -127,20 +98,73 @@ export default function Home() {
     }
   };
 
-  const startTracking = (userId: string) => {
+  const startTracking = () => {
     if ('geolocation' in navigator) {
       navigator.geolocation.watchPosition((position) => {
         const { latitude, longitude } = position.coords;
+        locationRef.current = { latitude, longitude };
         setUser((prev: any) => prev ? { ...prev, location: { coordinates: [longitude, latitude] } } : prev);
-        getSocket().emit('updateLocation', { userId, latitude, longitude });
       }, (err) => console.error(err), { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 });
     }
   };
 
+  // Polling Loop
+  useEffect(() => {
+    if (!user) return;
+    
+    const syncData = async () => {
+      try {
+        const res = await axios.post(`${API_URL}/sync`, {
+          userId: user._id,
+          latitude: locationRef.current.latitude,
+          longitude: locationRef.current.longitude,
+          mood: moodRef.current
+        });
+
+        if (res.data.partners) {
+          const updatedPartners = res.data.partners.map((p: any) => ({
+             _id: p._id,
+             name: p.name,
+             distance: p.distance,
+             location: { coordinates: [p.longitude, p.latitude] },
+             mood: p.mood
+          }));
+          setPartners(updatedPartners);
+
+          const radius = user.settings?.trackingRadius || 5;
+          
+          updatedPartners.forEach((p: any) => {
+             if (p.distance !== null) {
+               const inRadius = p.distance <= radius;
+               const wasIn = wasInRadiusMap.current[p._id];
+               if (wasIn !== undefined && inRadius !== wasIn) {
+                 if (inRadius) addNotification(`${p.name} entered your ${radius}km area 👀`);
+                 else addNotification(`${p.name} left your zone 🚶‍♀️`);
+               }
+               wasInRadiusMap.current[p._id] = inRadius;
+             }
+
+             const lastMood = lastMoodMap.current[p._id];
+             if (p.mood && lastMood !== undefined && p.mood !== lastMood) {
+               addNotification(`${p.name} is now feeling: ${p.mood}`);
+             }
+             lastMoodMap.current[p._id] = p.mood;
+          });
+        }
+      } catch (err) {
+        console.error('Sync failed', err);
+      }
+    };
+
+    syncData();
+    const intervalId = setInterval(syncData, 5000);
+    return () => clearInterval(intervalId);
+  }, [user?._id, user?.settings?.trackingRadius]);
+
   const updateMood = async (mood: string) => {
     if (!user) return;
     setUser({ ...user, mood });
-    getSocket().emit('updateMood', { userId: user._id, mood });
+    moodRef.current = mood;
   };
 
   const updateSettings = async (settings: any) => {
@@ -253,7 +277,7 @@ export default function Home() {
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 flex-1 min-h-[600px]">
         <div className="lg:col-span-3 h-[500px] lg:h-auto">
-          <MapComponent userLocation={user.location.coordinates as [number, number]} partners={partners} radius={user.settings.trackingRadius} />
+          <MapComponent userLocation={user.location?.coordinates as [number, number] || [0, 0]} partners={partners} radius={user.settings.trackingRadius} />
         </div>
 
         <div className="flex flex-col gap-6 overflow-y-auto pr-2 custom-scrollbar">
